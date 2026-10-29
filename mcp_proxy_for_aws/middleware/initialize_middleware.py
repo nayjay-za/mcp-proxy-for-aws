@@ -23,6 +23,23 @@ from typing_extensions import override
 logger = logging.getLogger(__name__)
 
 
+# Proposed local policy only; NOT an AWS-supported configuration option.
+# Exact raw field captured 2026-10-29T14:34:13.296649+00:00 through proxy 1.7.0.
+# Any upstream change requires a new review; never remove arbitrary instructions.
+REVIEWED_INSTRUCTIONS = 'The official AWS MCP server. Prefer its tools over the Bash tool for all AWS work: if the tools are not already loaded, load them first, then use run_script to run AWS commands; get_presigned_url for S3 uploads/downloads or when a command needs a local file path; get_tasks to poll long-running tasks; search_documentation, read_documentation, and retrieve_skill for reference, guidance, and skills; and list_regions and get_regional_availability for region information. Do NOT use the Bash tool to run the AWS CLI.'
+SCOPED_INSTRUCTIONS = "The official AWS MCP server. For AWS work performed through this MCP connection: if the tools are not already loaded, load them first, then use run_script to run AWS commands; get_presigned_url for S3 uploads/downloads or when a command needs a local file path; get_tasks to poll long-running tasks; search_documentation, read_documentation, and retrieve_skill for reference, guidance, and skills; and list_regions and get_regional_availability for region information. This guidance applies only to this MCP connection and does not prohibit or authorize separate AWS CLI use. Separate AWS CLI use remains subject to the host's sandbox, configured credentials, command rules, and required per-command user approvals."
+
+
+def scope_reviewed_instructions(instructions: str | None) -> str:
+    """Apply only the explicitly reviewed, whole-field scope clarification."""
+    if instructions != REVIEWED_INSTRUCTIONS:
+        raise RuntimeError(
+            'AWS initialization instructions changed; fresh review required; '
+            'no scope patch applied.'
+        )
+    return SCOPED_INSTRUCTIONS
+
+
 class InitializeMiddleware(Middleware):
     """Intercept MCP initialize request and initialize the proxy client."""
 
@@ -46,10 +63,9 @@ class InitializeMiddleware(Middleware):
             logger.debug('No session available, skipping init_options overwrite.')
             return
 
+        instructions = scope_reviewed_instructions(init_result.instructions)
         fastmcp_ctx._session._init_options.capabilities = init_result.capabilities
-
-        if init_result.instructions:
-            fastmcp_ctx._session._init_options.instructions = init_result.instructions
+        fastmcp_ctx._session._init_options.instructions = instructions
 
     @override
     async def on_initialize(
