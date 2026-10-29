@@ -3,7 +3,12 @@
 This personal fork is based on AWS `v1.7.0`, commit
 `22f1b3f8b7c4ef37112114b4af3d6c5a6c0a83bb`. It is a custom variant,
 not an AWS-endorsed configuration option or a universal proxy for arbitrary MCP
-endpoints. The upstream Apache-2.0 license, copyright, and NOTICE remain intact.
+endpoints. Before merging the variant into this fork's main branch, upstream
+changes through `ddf5dbb181d9c3b499e06375cca0f3b2a60e30dc` were integrated and
+the combined source was validated. That integration updates dependencies and
+tool-lookup error reporting; the initialization middleware still matches the
+reviewed v1.7.0 baseline apart from this patch. The upstream Apache-2.0 license,
+copyright, and NOTICE remain intact.
 
 ## Scope and rationale
 
