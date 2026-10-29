@@ -47,7 +47,7 @@ All environments below are local to the checkout; do not point live launchers at
 it as part of this procedure.
 
 ```sh
-git clone https://github.com/nayjay-za/mcp-proxy-for-aws.git personal-aws-proxy
+git clone git@github.com:nayjay-za/mcp-proxy-for-aws.git personal-aws-proxy
 cd personal-aws-proxy
 git checkout --detach <reviewed-full-commit-sha>
 git rev-parse HEAD
