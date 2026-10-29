@@ -12,9 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
+import copy
+import hashlib
+import inspect
+import json
 import mcp.types as mt
 import pytest
-from mcp_proxy_for_aws.middleware.initialize_middleware import InitializeMiddleware
+from mcp_proxy_for_aws.middleware.initialize_middleware import (
+    REVIEWED_INSTRUCTIONS,
+    SCOPED_INSTRUCTIONS,
+    InitializeMiddleware,
+    scope_reviewed_instructions,
+)
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 
@@ -39,6 +50,7 @@ async def test_on_initialize_connects_client():
         protocolVersion='2024-11-05',
         capabilities=mt.ServerCapabilities(),
         serverInfo=mt.Implementation(name='backend-server', version='2.0'),
+        instructions=REVIEWED_INSTRUCTIONS,
     )
 
     mock_factory = Mock()
@@ -69,8 +81,7 @@ async def test_on_initialize_connects_client():
 
     # Verify init_options capabilities were overwritten with backend server info
     assert mock_init_options.capabilities == mt.ServerCapabilities()
-    # Backend sent no instructions, so the proxy's own instructions are kept
-    assert mock_init_options.instructions == 'proxy instructions'
+    assert mock_init_options.instructions == SCOPED_INSTRUCTIONS
 
 
 @pytest.mark.asyncio
@@ -141,7 +152,7 @@ async def test_on_initialize_overwrites_init_options_with_backend_info():
         protocolVersion='2024-11-05',
         capabilities=backend_capabilities,
         serverInfo=mt.Implementation(name='backend-mcp', version='3.1'),
-        instructions='backend instructions',
+        instructions=REVIEWED_INSTRUCTIONS,
     )
 
     mock_client = Mock()
@@ -173,7 +184,7 @@ async def test_on_initialize_overwrites_init_options_with_backend_info():
     await middleware.on_initialize(mock_context, mock_call_next)
 
     assert mock_init_options.capabilities == backend_capabilities
-    assert mock_init_options.instructions == 'backend instructions'
+    assert mock_init_options.instructions == SCOPED_INSTRUCTIONS
 
 
 @pytest.mark.asyncio
@@ -188,6 +199,7 @@ async def test_on_initialize_disables_prompts_and_resources():
         protocolVersion='2024-11-05',
         capabilities=backend_capabilities,
         serverInfo=mt.Implementation(name='backend', version='1.0'),
+        instructions=REVIEWED_INSTRUCTIONS,
     )
 
     mock_client = Mock()
@@ -228,6 +240,7 @@ async def test_on_initialize_skips_overwrite_when_no_session():
         protocolVersion='2024-11-05',
         capabilities=mt.ServerCapabilities(),
         serverInfo=mt.Implementation(name='backend', version='1.0'),
+        instructions=REVIEWED_INSTRUCTIONS,
     )
 
     mock_factory = Mock()
@@ -245,3 +258,141 @@ async def test_on_initialize_skips_overwrite_when_no_session():
     # Should not raise, just skip overwrite
     await middleware.on_initialize(mock_context, mock_call_next)
     mock_call_next.assert_called_once_with(mock_context)
+
+
+def test_captured_full_field_accepted():
+    """Accept the complete reviewed field without normalization."""
+    assert scope_reviewed_instructions(REVIEWED_INSTRUCTIONS) == SCOPED_INSTRUCTIONS
+    assert not REVIEWED_INSTRUCTIONS.startswith('\n')
+    assert not REVIEWED_INSTRUCTIONS.endswith('\n')
+
+
+@pytest.mark.parametrize(
+    'text',
+    [
+        None,
+        '',
+        REVIEWED_INSTRUCTIONS + '\n',
+        ' ' + REVIEWED_INSTRUCTIONS,
+        REVIEWED_INSTRUCTIONS.lower(),
+        REVIEWED_INSTRUCTIONS + ' More rules.',
+        SCOPED_INSTRUCTIONS,
+    ],
+)
+def test_any_unreviewed_field_rejected(text):
+    """Reject absent, reformatted, extended, and already scoped fields."""
+    with pytest.raises(RuntimeError, match='fresh review required'):
+        scope_reviewed_instructions(text)
+
+
+def test_only_two_reviewed_text_spans_changed():
+    """Preserve all guidance except the two explicitly reviewed scope spans."""
+    expected = REVIEWED_INSTRUCTIONS.replace(
+        'Prefer its tools over the Bash tool for all AWS work:',
+        'For AWS work performed through this MCP connection:',
+    ).replace(
+        'Do NOT use the Bash tool to run the AWS CLI.',
+        'This guidance applies only to this MCP connection and does not prohibit or '
+        'authorize separate AWS CLI use. Separate AWS CLI use remains subject to '
+        "the host's sandbox, configured credentials, command rules, and required "
+        'per-command user approvals.',
+    )
+    assert SCOPED_INSTRUCTIONS == expected
+
+
+def overwrite_fixture(text=REVIEWED_INSTRUCTIONS):
+    """Build synthetic session state and a real backend initialization result."""
+    options = SimpleNamespace(
+        instructions='original local',
+        capabilities='old',
+        server_name='unchanged',
+        server_version='1.7.0',
+    )
+    context = Mock()
+    context.fastmcp_context._session._init_options = options
+    result = mt.InitializeResult(
+        protocolVersion='2025-03-26',
+        capabilities=mt.ServerCapabilities(tools=mt.ToolsCapability(listChanged=True)),
+        serverInfo=mt.Implementation(name='backend', version='1.0'),
+        instructions=text,
+    )
+    return context, result, options
+
+
+def test_session_only_changes_instructions_and_existing_capability_forward():
+    """Preserve backend metadata and session identity while forwarding capabilities."""
+    context, result, options = overwrite_fixture()
+    before_result = result.model_dump()
+    InitializeMiddleware(Mock())._overwrite_init_options(context, result)
+    assert options.instructions == SCOPED_INSTRUCTIONS
+    assert options.capabilities is result.capabilities
+    assert options.server_name == 'unchanged'
+    assert options.server_version == '1.7.0'
+    assert result.model_dump() == before_result
+
+
+@pytest.mark.parametrize('text', [None, REVIEWED_INSTRUCTIONS + ' Updated rule.'])
+async def test_drift_fails_before_session_mutation_or_call_next(text):
+    """Fail initialization before mutating the session or sending a success response."""
+    context, result, options = overwrite_fixture(text)
+    before = copy.deepcopy(vars(options))
+    context.message = create_initialize_request('test-client')
+    client = Mock(initialize_result=result, _connect=AsyncMock())
+    factory = Mock(get_client=AsyncMock(return_value=client))
+    call_next = AsyncMock()
+    with pytest.raises(RuntimeError, match='fresh review required'):
+        await InitializeMiddleware(factory).on_initialize(context, call_next)
+    assert vars(options) == before
+    call_next.assert_not_called()
+
+
+@pytest.mark.parametrize('fastmcp_context', [None, Mock(_session=None)])
+def test_existing_no_session_behavior_unchanged(fastmcp_context):
+    """Keep the original no-session early return even for absent instructions."""
+    context = Mock(fastmcp_context=fastmcp_context)
+    InitializeMiddleware(Mock())._overwrite_init_options(context, Mock(instructions=None))
+
+
+def test_other_middleware_code_matches_reviewed_baseline():
+    """Keep all unrelated code identical to v1.7.0, ignoring formatting and comments."""
+    import mcp_proxy_for_aws.middleware.initialize_middleware as module
+
+    tree = ast.parse(inspect.getsource(module))
+    tree.body = [
+        node
+        for node in tree.body
+        if not (
+            isinstance(node, ast.FunctionDef)
+            and node.name == 'scope_reviewed_instructions'
+            or isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id in {'REVIEWED_INSTRUCTIONS', 'SCOPED_INSTRUCTIONS'}
+                for target in node.targets
+            )
+        )
+    ]
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == 'InitializeMiddleware':
+            node.body = [
+                method
+                for method in node.body
+                if getattr(method, 'name', None) != '_overwrite_init_options'
+            ]
+
+    def canonical(node):
+        if isinstance(node, ast.AST):
+            return [
+                type(node).__name__,
+                {
+                    field: canonical(value)
+                    for field, value in ast.iter_fields(node)
+                    if field != 'type_params'
+                },
+            ]
+        if isinstance(node, list):
+            return [canonical(value) for value in node]
+        return node
+
+    digest = hashlib.sha256(json.dumps(canonical(tree), sort_keys=True).encode()).hexdigest()
+    assert digest == '580d945bf0d801e14f1d6de04f09001c33d8271d555e0ed866bb83f8315cf183'

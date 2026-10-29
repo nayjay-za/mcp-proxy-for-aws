@@ -1,3 +1,9 @@
+> **Personal custom variant:** this branch is based on upstream v1.7.0 and scopes one
+> exactly reviewed AWS initialization instruction field to its MCP connection.
+> It fails initialization if that field changes. This is not an AWS-endorsed option
+> or a general proxy for arbitrary MCP endpoints. See [FORK.md](FORK.md) for scope,
+> source installation, maintenance, and rollback. Upstream documentation follows.
+
 # MCP Proxy for AWS
 
 ## Overview
