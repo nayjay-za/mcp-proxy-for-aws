@@ -131,3 +131,32 @@ repeat the frozen source install there. Keep its lockfile. Do not overwrite a di
 checkout or assume a source checkout changes an already running MCP process.
 Changing live launcher configuration or activating/rolling back a runtime is a
 separate operation, never a side effect of this source workflow.
+
+## Correlated tool diagnostics
+
+Tool exceptions now return a proxy-generated reference ID, exception class and
+available numeric HTTP/MCP status. The matching stderr event contains elapsed
+milliseconds and a bounded exception/cause chain with stack file basenames,
+function names and line numbers. It excludes exception messages, source lines,
+locals, URLs, headers, credentials and tool arguments/results. Empty exception
+messages therefore still provide useful evidence. HTTP 401 and 403 are reported
+separately; a proxy HTTP status does not establish an AWS operation's IAM outcome.
+No automatic retry, credential change or authorization change is introduced.
+
+The configured stderr formatter reduces other log records to safe metadata,
+including background transport tasks without a request reference. DEBUG no longer
+logs payloads. Formatting uses a copy so other handlers are unaffected. Tool
+success/start events require INFO; failures remain visible at the default ERROR
+level. A reference correlates local events, not an upstream AWS request ID, and
+background tasks can have an absent or inherited reference.
+
+Completed upstream tool errors retain their content, structured content, metadata
+and error flag, including through per-call profile routing. Their payloads are
+not logged or replaced with generic proxy errors. A missing `api_calls` record
+still does not prove that no AWS API ran. Improved visibility does not establish
+that the original intermittent failure has been repaired.
+
+Install only an exact reviewed, pushed source SHA using the frozen source
+procedure above. Record the source SHA and installed file verification separately
+from the unchanged distribution version. Changing the launcher does not replace
+an already-running process; verify a fresh proxy runtime before claiming activation.

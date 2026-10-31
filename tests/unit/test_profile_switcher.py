@@ -16,6 +16,7 @@
 
 import asyncio
 import httpx
+import mcp.types as mt
 import pytest
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import MiddlewareContext
@@ -217,15 +218,17 @@ class TestPerCallProfileOverride:
 
     @pytest.mark.asyncio
     async def test_profile_override_propagates_is_error(self, middleware, mock_context):
-        """Backend isError=True is propagated as a ToolError."""
+        """Backend isError=True preserves structured content and error status."""
         mock_client = AsyncMock()
         mock_call_result = MagicMock()
-        mock_content_block = MagicMock()
+        mock_content_block = mt.TextContent(type='text', text='placeholder')
         mock_content_block.text = 'backend error message'
         mock_call_result.content = [mock_content_block]
         mock_call_result.structured_content = None
         mock_call_result.meta = None
         mock_call_result.is_error = True
+        mock_call_result.structured_content = {'code': 'AccessDenied', 'api_calls': []}
+        mock_call_result.meta = {'source': 'upstream'}
         mock_client.call_tool.return_value = mock_call_result
 
         mock_context.message = Mock()
@@ -234,8 +237,11 @@ class TestPerCallProfileOverride:
         call_next = AsyncMock()
 
         with patch.object(middleware, '_get_profile_client', return_value=mock_client):
-            with pytest.raises(ToolError, match='backend error message'):
-                await middleware.on_call_tool(mock_context, call_next)
+            result = await middleware.on_call_tool(mock_context, call_next)
+        assert result.is_error
+        assert result.structured_content == mock_call_result.structured_content
+        assert result.meta == mock_call_result.meta
+        assert result.content == mock_call_result.content
 
     @pytest.mark.asyncio
     async def test_profile_override_connection_failure(self, middleware, mock_context):
@@ -376,6 +382,8 @@ class TestProfileClientInvalidation:
         content_block.text = 'backend error'
         call_result.content = [content_block]
         call_result.is_error = True
+        call_result.structured_content = None
+        call_result.meta = None
         client.call_tool.return_value = call_result
         middleware._profile_clients['dev-profile'] = client
 
@@ -384,8 +392,8 @@ class TestProfileClientInvalidation:
         mock_context.message.arguments = {'arg': 'value', 'aws_profile': 'dev-profile'}
         call_next = AsyncMock()
 
-        with pytest.raises(ToolError, match='backend error'):
-            await middleware.on_call_tool(mock_context, call_next)
+        result = await middleware.on_call_tool(mock_context, call_next)
+        assert result.is_error
 
         assert middleware._profile_clients['dev-profile'] is client
         client.__aexit__.assert_not_awaited()
@@ -641,17 +649,19 @@ class TestFix4RetryExceptionChaining:
 
 
 class TestFix5IsErrorPropagation:
-    """Fix #5: Backend isError=True is propagated as ToolError."""
+    """Backend errors preserve structured content and error status."""
 
     @pytest.mark.asyncio
-    async def test_is_error_true_raises_tool_error(self, middleware, mock_context):
-        """When backend returns isError=True, a ToolError is raised."""
+    async def test_is_error_true_preserves_result(self, middleware, mock_context):
+        """When backend returns isError=True, all result fields are preserved."""
         mock_client = AsyncMock()
         mock_call_result = MagicMock()
-        mock_content_block = MagicMock()
+        mock_content_block = mt.TextContent(type='text', text='placeholder')
         mock_content_block.text = 'Access denied for this operation'
         mock_call_result.content = [mock_content_block]
         mock_call_result.is_error = True
+        mock_call_result.structured_content = {'code': 'AccessDenied', 'api_calls': []}
+        mock_call_result.meta = {'source': 'upstream'}
         mock_client.call_tool.return_value = mock_call_result
 
         mock_context.message = Mock()
@@ -660,8 +670,11 @@ class TestFix5IsErrorPropagation:
         call_next = AsyncMock()
 
         with patch.object(middleware, '_get_profile_client', return_value=mock_client):
-            with pytest.raises(ToolError, match='Access denied for this operation'):
-                await middleware.on_call_tool(mock_context, call_next)
+            result = await middleware.on_call_tool(mock_context, call_next)
+        assert result.is_error
+        assert result.structured_content == mock_call_result.structured_content
+        assert result.meta == mock_call_result.meta
+        assert result.content == mock_call_result.content
 
     @pytest.mark.asyncio
     async def test_is_error_false_returns_result(self, middleware, mock_context):
@@ -697,10 +710,12 @@ class TestRaiseOnErrorFalseEnforced:
         """
         mock_client = AsyncMock()
         mock_call_result = MagicMock()
-        mock_content_block = MagicMock()
+        mock_content_block = mt.TextContent(type='text', text='placeholder')
         mock_content_block.text = 'ThrottlingException: Rate exceeded'
         mock_call_result.content = [mock_content_block]
         mock_call_result.is_error = True
+        mock_call_result.structured_content = {'code': 'AccessDenied', 'api_calls': []}
+        mock_call_result.meta = {'source': 'upstream'}
         mock_client.call_tool.return_value = mock_call_result
 
         mock_context.message = Mock()
@@ -709,8 +724,11 @@ class TestRaiseOnErrorFalseEnforced:
         call_next = AsyncMock()
 
         with patch.object(middleware, '_get_profile_client', return_value=mock_client):
-            with pytest.raises(ToolError, match='ThrottlingException'):
-                await middleware.on_call_tool(mock_context, call_next)
+            result = await middleware.on_call_tool(mock_context, call_next)
+        assert result.is_error
+        assert result.structured_content == mock_call_result.structured_content
+        assert result.meta == mock_call_result.meta
+        assert result.content == mock_call_result.content
 
         # Confirm raise_on_error=False was passed
         mock_client.call_tool.assert_called_once_with(

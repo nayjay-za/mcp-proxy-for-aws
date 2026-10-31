@@ -13,38 +13,24 @@
 # limitations under the License.
 
 import anyio
-import httpx
 import logging
 import mcp.types as mt
+import time
+import uuid
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
+from mcp_proxy_for_aws.diagnostics import exception_details, reference_id
 
 
 logger = logging.getLogger(__name__)
 
 
 class ToolErrorMiddleware(Middleware):
-    """Middleware that ensures tool calls never hang and always return a response.
+    """Bound tool calls and provide correlated, payload-free failure diagnostics."""
 
-    Implements two layers of protection:
-    1. Timeout — bounds how long a tool call can take, breaking any hang.
-    2. Error propagation — catches any error and returns an error message
-       to the agent so it always gets a response.
-
-    Reconnection is handled automatically by fastmcp on every tool call.
-    """
-
-    def __init__(
-        self,
-        tool_call_timeout: float = 300.0,
-    ) -> None:
-        """Initialize the middleware.
-
-        Args:
-            tool_call_timeout: Maximum seconds a tool call may take before being
-                cancelled.
-        """
+    def __init__(self, tool_call_timeout: float = 300.0) -> None:
+        """Set the maximum call duration in seconds."""
         super().__init__()
         self._tool_call_timeout = tool_call_timeout
 
@@ -53,38 +39,50 @@ class ToolErrorMiddleware(Middleware):
         context: MiddlewareContext[mt.CallToolRequestParams],
         call_next: CallNext[mt.CallToolRequestParams, ToolResult],
     ) -> ToolResult:
-        """Wrap tool calls with timeout and error handling."""
+        """Preserve upstream results and report safe details for raised exceptions."""
+        ref = uuid.uuid4().hex
+        token = reference_id.set(ref)
+        started = time.monotonic()
+        safe = {'proxy_safe_diagnostic': True}
         try:
+            logger.info('tool_start reference=%s', ref, extra=safe)
             with anyio.fail_after(self._tool_call_timeout):
-                return await call_next(context)
-        except Exception as e:
-            tool_name = context.message.name
-            logger.error('Tool call %r failed: %s.', tool_name, e)
-            message = f'Tool call {tool_name!r} failed: {e}. Please retry.'
-            if self._is_credential_error(e):
-                message = (
-                    f'Tool call {tool_name!r} failed due to expired or invalid AWS credentials.'
-                    ' Please refresh your credentials and retry.'
-                    ' The proxy will automatically use the new credentials on the next request.'
+                result = await call_next(context)
+            if result.is_error:
+                logger.error(
+                    'tool_upstream_error reference=%s elapsed_ms=%d',
+                    ref,
+                    int((time.monotonic() - started) * 1000),
+                    extra=safe,
                 )
-            raise ToolError(message) from e
-
-    @staticmethod
-    def _is_credential_error(error: Exception) -> bool:
-        """Check if the error is likely caused by expired or invalid credentials.
-
-        Walks the exception chain (__cause__/__context__) because the
-        HTTPStatusError may be wrapped.  isinstance already respects the
-        MRO, so subclasses are caught too.
-        """
-        current: BaseException | None = error
-        while current is not None:
-            if isinstance(current, httpx.HTTPStatusError) and current.response.status_code in (
-                401,
-                403,
-            ):
-                return True
-            if isinstance(current, ValueError) and 'credentials' in str(current).lower():
-                return True
-            current = current.__cause__ or current.__context__
-        return False
+            else:
+                logger.info(
+                    'tool_success reference=%s elapsed_ms=%d',
+                    ref,
+                    int((time.monotonic() - started) * 1000),
+                    extra=safe,
+                )
+            # Preserve content, structuredContent, meta and isError unchanged.
+            return result
+        except Exception as error:
+            details = exception_details(error)
+            logger.error(
+                'tool_exception reference=%s elapsed_ms=%d details=%s',
+                ref,
+                int((time.monotonic() - started) * 1000),
+                details,
+                extra=safe,
+            )
+            status = ''
+            if details['http_status'] is not None:
+                status += f' HTTP {details["http_status"]}.'
+            if details['mcp_code'] is not None:
+                status += f' MCP code {details["mcp_code"]}.'
+            # Exception messages can contain code, bodies, URLs or secrets.
+            raise ToolError(
+                f'AWS MCP proxy request failed ({details["category"]}; '
+                f'{details["chain"][0]["type"]}).{status} Reference: {ref}. '
+                'Consult proxy diagnostics before deciding whether to retry.'
+            ) from error
+        finally:
+            reference_id.reset(token)

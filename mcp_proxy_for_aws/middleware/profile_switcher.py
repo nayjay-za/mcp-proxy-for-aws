@@ -259,17 +259,11 @@ class ProfileOverrideMiddleware(Middleware):
 
         try:
             result = await client.call_tool(context.message.name, arguments, raise_on_error=False)
-            if result.is_error:
-                # Propagate the backend error message to the agent
-                error_text = ''
-                for block in result.content:
-                    if hasattr(block, 'text'):
-                        error_text += block.text  # type: ignore[union-attr]
-                raise ToolError(error_text or f'Tool call failed using profile {profile!r}.')
             return ToolResult(
                 content=result.content,
                 structured_content=result.structured_content,
                 meta=result.meta,
+                is_error=result.is_error,
             )
         except ToolError:
             raise

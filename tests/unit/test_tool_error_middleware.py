@@ -1,172 +1,227 @@
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Unit tests for ToolErrorMiddleware."""
+"""Tests for correlated diagnostics without request or credential disclosure."""
 
 import anyio
 import httpx
+import io
+import logging
 import mcp.types as mt
 import pytest
+import re
+from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import MiddlewareContext
 from fastmcp.tools import ToolResult
 from mcp import McpError
 from mcp.types import ErrorData
+from mcp_proxy_for_aws.diagnostics import SafeDiagnosticFilter, exception_details, reference_id
+from mcp_proxy_for_aws.logging_config import configure_logging
 from mcp_proxy_for_aws.middleware.tool_error_middleware import ToolErrorMiddleware
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 
-def _make_context(tool_name: str = 'test_tool') -> MiddlewareContext[mt.CallToolRequestParams]:
-    """Create a minimal MiddlewareContext for tool calls."""
-    params = Mock(spec=mt.CallToolRequestParams)
-    params.name = tool_name
-    return MiddlewareContext[mt.CallToolRequestParams](
-        message=params,
+def context():
+    """Build a request with synthetic sensitive input to check non-disclosure."""
+    return MiddlewareContext(
+        message=mt.CallToolRequestParams(
+            name='aws___run_script', arguments={'code': 'PRIVATE_CODE'}
+        ),
         type='request',
         method='tools/call',
     )
 
 
-def _make_middleware(tool_call_timeout: float = 5.0) -> ToolErrorMiddleware:
-    """Create a ToolErrorMiddleware with mocked dependencies."""
-    return ToolErrorMiddleware(tool_call_timeout=tool_call_timeout)
-
-
-class TestToolErrorMiddleware:
-    """Test cases for ToolErrorMiddleware."""
-
-    @pytest.mark.asyncio
-    async def test_passes_through_on_success(self):
-        """Successful tool calls pass through unchanged."""
-        middleware = _make_middleware()
-        expected = ToolResult(content=[mt.TextContent(type='text', text='ok')])
-        call_next = AsyncMock(return_value=expected)
-        context = _make_context()
-
-        result = await middleware.on_call_tool(context, call_next)
-
-        assert result is expected
-        call_next.assert_awaited_once_with(context)
-
-    @pytest.mark.asyncio
-    async def test_catches_exception_raises_tool_error(self):
-        """Exceptions are caught and raised as ToolError."""
-        middleware = _make_middleware()
-        call_next = AsyncMock(
-            side_effect=McpError(ErrorData(code=-1, message='Connection closed'))
+@pytest.mark.asyncio
+async def test_success_and_structured_errors_preserved(caplog):
+    """Both success and upstream errors retain every result field unchanged."""
+    for is_error in (False, True):
+        result = ToolResult(
+            content=[
+                mt.TextContent(type='text', text='upstream detail'),
+                mt.ImageContent(type='image', data='AA==', mimeType='image/png'),
+            ],
+            structured_content={'api_calls': [], 'code': 'UPSTREAM_ERROR'},
+            meta={'upstream': 'metadata'},
+            is_error=is_error,
         )
-        context = _make_context()
-
-        with pytest.raises(ToolError, match='Connection closed'):
-            await middleware.on_call_tool(context, call_next)
-
-    @pytest.mark.asyncio
-    async def test_timeout_raises_tool_error(self):
-        """Tool calls that exceed the timeout raise a ToolError."""
-        middleware = _make_middleware(tool_call_timeout=0.1)
-
-        async def hang_forever(context: MiddlewareContext[mt.CallToolRequestParams]) -> ToolResult:
-            await anyio.sleep(999)
-            return ToolResult(content=[])  # unreachable
-
-        context = _make_context(tool_name='slow_tool')
-
-        with pytest.raises(ToolError, match='slow_tool'):
-            await middleware.on_call_tool(context, hang_forever)
-
-    @pytest.mark.asyncio
-    async def test_credential_error_suggests_profile(self):
-        """Credential errors suggest using long-lived credentials."""
-        middleware = _make_middleware()
-        response = Mock(spec=httpx.Response)
-        response.status_code = 401
-        call_next = AsyncMock(
-            side_effect=httpx.HTTPStatusError('Unauthorized', request=Mock(), response=response)
+        assert (
+            await ToolErrorMiddleware().on_call_tool(context(), AsyncMock(return_value=result))
+            is result
         )
-        context = _make_context()
+    assert 'upstream detail' not in caplog.text
+    assert 'PRIVATE_CODE' not in caplog.text
 
-        with pytest.raises(ToolError, match='expired or invalid AWS credentials') as exc_info:
-            await middleware.on_call_tool(context, call_next)
-        assert 'refresh your credentials' in str(exc_info.value)
 
-    @pytest.mark.asyncio
-    async def test_credential_error_on_403(self):
-        """403 Forbidden is recognised as a credential error."""
-        middleware = _make_middleware()
-        response = Mock(spec=httpx.Response)
-        response.status_code = 403
-        call_next = AsyncMock(
-            side_effect=httpx.HTTPStatusError('Forbidden', request=Mock(), response=response)
-        )
-        context = _make_context()
-
-        with pytest.raises(ToolError, match='expired or invalid AWS credentials'):
-            await middleware.on_call_tool(context, call_next)
-
-    @pytest.mark.asyncio
-    async def test_credential_error_wrapped_in_cause(self):
-        """401 wrapped via __cause__ is still detected."""
-        middleware = _make_middleware()
-        response = Mock(spec=httpx.Response)
-        response.status_code = 401
-        inner = httpx.HTTPStatusError('Unauthorized', request=Mock(), response=response)
-        outer = RuntimeError('request failed')
-        outer.__cause__ = inner
-
-        call_next = AsyncMock(side_effect=outer)
-        context = _make_context()
-
-        with pytest.raises(ToolError, match='expired or invalid AWS credentials'):
-            await middleware.on_call_tool(context, call_next)
-
-    @pytest.mark.asyncio
-    async def test_credential_error_wrapped_in_context(self):
-        """401 wrapped via __context__ (implicit chaining) is still detected."""
-        middleware = _make_middleware()
-        response = Mock(spec=httpx.Response)
-        response.status_code = 401
-        inner = httpx.HTTPStatusError('Unauthorized', request=Mock(), response=response)
-        outer = RuntimeError('wrapped')
-        outer.__context__ = inner
-
-        call_next = AsyncMock(side_effect=outer)
-        context = _make_context()
-
-        with pytest.raises(ToolError, match='expired or invalid AWS credentials'):
-            await middleware.on_call_tool(context, call_next)
-
-    @pytest.mark.asyncio
-    async def test_non_credential_error_no_suggestion(self):
-        """Non-credential errors do not suggest credential remediation."""
-        middleware = _make_middleware()
-        call_next = AsyncMock(side_effect=RuntimeError('transport died'))
-        context = _make_context()
-
-        with pytest.raises(ToolError) as exc_info:
-            await middleware.on_call_tool(context, call_next)
-        assert '--profile' not in str(exc_info.value)
-
-    @pytest.mark.asyncio
-    async def test_credential_error_from_missing_credentials_valueerror(self):
-        """ValueError about missing credentials is recognised as a credential error."""
-        middleware = _make_middleware()
-        call_next = AsyncMock(
-            side_effect=ValueError(
-                'No AWS credentials available. Configure credentials or use --skip-auth.'
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'error,category,status',
+    [
+        (RuntimeError(), 'internal', None),
+        (httpx.ConnectError('PRIVATE_TOKEN'), 'transport', None),
+        (httpx.ReadTimeout('PRIVATE_TOKEN'), 'timeout', None),
+        (
+            McpError(
+                ErrorData(code=-32602, message='PRIVATE_TOKEN', data={'secret': 'PRIVATE_TOKEN'})
+            ),
+            'mcp',
+            None,
+        ),
+        *[
+            (
+                httpx.HTTPStatusError(
+                    'PRIVATE_TOKEN',
+                    request=httpx.Request(
+                        'POST',
+                        'https://example.invalid/PRIVATE_URL',
+                        headers={'Authorization': 'PRIVATE_TOKEN'},
+                    ),
+                    response=httpx.Response(code),
+                ),
+                category,
+                code,
             )
-        )
-        context = _make_context()
+            for code, category in [
+                (401, 'authentication'),
+                (403, 'authorization'),
+                (429, 'rate_limit'),
+                (500, 'http'),
+            ]
+        ],
+    ],
+)
+async def test_errors_have_safe_reference_and_type(error, category, status, caplog):
+    """Empty, transport, auth and protocol errors carry safe diagnostic references."""
+    with pytest.raises(ToolError) as caught:
+        await ToolErrorMiddleware().on_call_tool(context(), AsyncMock(side_effect=error))
+    message = str(caught.value)
+    match = re.search(r'Reference: ([a-f0-9]{32})', message)
+    assert match is not None
+    assert match.group(1) in caplog.text
+    assert category in message
+    assert type(error).__name__ in message
+    assert caught.value.__cause__ is error
+    if status:
+        assert f'HTTP {status}' in message
+    if isinstance(error, McpError):
+        assert 'MCP code -32602' in message
+    assert 'PRIVATE_' not in message + caplog.text
+    assert reference_id.get() is None
 
-        with pytest.raises(ToolError, match='expired or invalid AWS credentials'):
-            await middleware.on_call_tool(context, call_next)
+
+@pytest.mark.asyncio
+async def test_timeout_is_bounded_and_named(caplog):
+    """An empty TimeoutError carries its class, elapsed duration and reference."""
+
+    async def hang(context: MiddlewareContext[mt.CallToolRequestParams]) -> ToolResult:
+        await anyio.sleep_forever()
+        return ToolResult(content=[])
+
+    with pytest.raises(ToolError, match='timeout; TimeoutError'):
+        await ToolErrorMiddleware(0.01).on_call_tool(context(), hang)
+    assert 'elapsed_ms=' in caplog.text
+
+
+def test_nested_causes_cycles_and_tracebacks():
+    """Cause chains keep frame locations but omit messages, locals and source lines."""
+    try:
+        raise httpx.ConnectError('PRIVATE_TOKEN')
+    except httpx.ConnectError as inner:
+        outer = RuntimeError('PRIVATE_PAYLOAD')
+        outer.__cause__ = inner
+        inner.__context__ = outer
+        details = exception_details(outer)
+    assert [x['type'] for x in details['chain']] == ['RuntimeError', 'ConnectError']
+    assert (
+        details['chain'][1]['frames'][0]['function'] == 'test_nested_causes_cycles_and_tracebacks'
+    )
+    assert 'PRIVATE_' not in str(details)
+    assert details['category'] == 'transport'
+
+
+def test_deep_chain_is_bounded():
+    """Malformed or exceptionally long chains cannot grow diagnostics without bound."""
+    error = RuntimeError()
+    for _ in range(100):
+        outer = RuntimeError()
+        outer.__cause__ = error
+        error = outer
+    assert len(exception_details(error)['chain']) == 16
+
+
+@pytest.mark.parametrize('with_reference', [True, False])
+def test_dependency_logs_strip_all_payload_fields(with_reference):
+    """Background tasks and request tasks both omit arbitrary messages and trace text."""
+    token = reference_id.set('test-reference' if with_reference else None)
+    try:
+        try:
+            raise RuntimeError('PRIVATE_TOKEN')
+        except RuntimeError as error:
+            record = logging.LogRecord(
+                'fastmcp.server',
+                logging.ERROR,
+                __file__,
+                1,
+                'PRIVATE_PAYLOAD %s',
+                ('PRIVATE_ARG',),
+                (type(error), error, error.__traceback__),
+            )
+            record.exc_text = 'PRIVATE_CACHED_EXCEPTION'
+            record.stack_info = 'PRIVATE_STACK'
+        assert SafeDiagnosticFilter().filter(record)
+        text = logging.Formatter('%(message)s').format(record)
+        assert 'RuntimeError' in text
+        assert 'PRIVATE_' not in text
+    finally:
+        reference_id.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_real_protocol_failure_and_log_redaction():
+    """Exercise FastMCP's own wrapper through the normal protocol, without AWS."""
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    output = io.StringIO()
+    try:
+        configure_logging('DEBUG')
+        handler = root.handlers[0]
+        assert isinstance(handler, logging.StreamHandler)
+        handler.setStream(output)
+        server = FastMCP('local-test')
+        server.add_middleware(ToolErrorMiddleware())
+
+        @server.tool()
+        async def failure() -> str:
+            """Raise a controlled local failure without AWS or networking."""
+            logging.getLogger('dependency').error('Authorization PRIVATE_TOKEN')
+            raise RuntimeError('PRIVATE_TOKEN')
+
+        with anyio.fail_after(10):
+            async with Client(server) as client:
+                result = await client.call_tool('failure', {}, raise_on_error=False)
+        assert result.is_error
+        assert isinstance(result.content[0], mt.TextContent)
+        assert 'Reference:' in result.content[0].text
+        assert 'RuntimeError' in output.getvalue()
+        assert 'PRIVATE_TOKEN' not in output.getvalue() + str(result)
+    finally:
+        root.handlers = handlers
+        root.setLevel(level)
+
+
+@pytest.mark.asyncio
+async def test_parallel_requests_have_distinct_references():
+    """Concurrent failures keep separate references and restore their parent context."""
+    import asyncio
+
+    async def fail():
+        try:
+            await ToolErrorMiddleware().on_call_tool(
+                context(), AsyncMock(side_effect=RuntimeError())
+            )
+        except ToolError as error:
+            match = re.search(r'Reference: ([a-f0-9]{32})', str(error))
+            assert match is not None
+            return match.group(1)
+
+    references = await asyncio.gather(fail(), fail())
+    assert references[0] != references[1]
+    assert reference_id.get() is None

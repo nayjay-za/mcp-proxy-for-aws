@@ -16,6 +16,7 @@
 
 import logging
 import sys
+from mcp_proxy_for_aws.diagnostics import SafeDiagnosticFormatter
 
 
 def configure_logging(level: str | None = None) -> None:
@@ -34,7 +35,7 @@ def configure_logging(level: str | None = None) -> None:
 
     # Create console handler with formatting
     console_handler = logging.StreamHandler(sys.stderr)
-    console_handler.setFormatter(logging.Formatter(log_format, date_format))
+    console_handler.setFormatter(SafeDiagnosticFormatter(log_format, date_format))
 
     # Configure root logger
     root_logger = logging.getLogger()

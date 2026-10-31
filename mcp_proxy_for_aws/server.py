@@ -258,7 +258,7 @@ def add_logging_middleware(mcp: FastMCP, log_level: str) -> None:
         LoggingMiddleware(
             logger=middleware_logger,
             log_level=middleware_logger.level,
-            include_payloads=True,
+            include_payloads=False,
             include_payload_length=True,
         )
     )
